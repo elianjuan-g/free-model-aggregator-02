@@ -406,6 +406,22 @@ async function dialOnce(
 }
 
 /**
+ * Normalize a string for the token check: models often return the prompt's
+ * unique token with different punctuation, spacing, or casing (for example
+ * "ZEBRA 4721", "ZEBRA-4721.", wrapped in backticks, or split across a
+ * line break). A completion that carries the token in any of those forms
+ * is a real answer, not a refusal, so the check compares the normalized
+ * forms and the caller still returns the original text untouched.
+ */
+function normToken(s: string): string {
+  return s
+    .normalize('NFKC')
+    .replace(/[\u200B-\u200D\uFEFF]/g, '')
+    .replace(/[^A-Za-z0-9]/g, '')
+    .toUpperCase();
+}
+
+/**
  * What is wrong with a completion, or null when it is a real answer: a
  * refusal or a content filter, an empty completion, or a completion that
  * does not carry the prompt's unique token. The token is checked in the
@@ -421,7 +437,7 @@ function completionProblem(
   if (finishReason === 'refusal' || finishReason === 'content_filter') return finishReason;
   const combined = `${text}\n${argsText}`;
   if (combined.trim() === '') return 'empty_content';
-  if (token !== null && !combined.includes(token)) return 'missing_token';
+  if (token !== null && !normToken(combined).includes(normToken(token))) return 'missing_token';
   return null;
 }
 
