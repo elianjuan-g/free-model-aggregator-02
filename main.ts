@@ -33,14 +33,28 @@
 //   best JSON-capable model. Nothing else is routed per task type.
 //
 // FAILOVER (10% of the score)
-//   A refused gateway call is not an answer. A 429 (or a dropped connection)
-//   is retried once on the same model after a short wait; a 5xx or a 400
-//   fails over at once to the next strongest model that meets the request.
+//   A refused gateway call is not an answer. The failover is direct: a 429,
+//   a 5xx or a 400 fails over at once to the next strongest model that meets
+//   the request, because the free tier's quota and the trial's 240 seconds
+//   are too tight to spend on a model that already refused. Only a pure
+//   transport failure — a connection that dropped before any answer, or a
+//   timeout on the call itself — is retried once on the same model, briefly.
 //   A 401 means the trial has no key, so every model would refuse it, and
 //   the prompt is given up on. At most three model calls serve one prompt,
-//   so one prompt never starves the other five. Every refusal a retry or a
-//   failover recovered from is reported on the answer in the header
-//   `x-makefun-upstream-failures`, a JSON array of at most eight rows.
+//   so one prompt never starves the other five. A model that refused for a
+//   reason other than transport or timeout is skipped for the rest of the
+//   trial (a circuit breaker): re-dialling it would only burn quota.
+//   Every refusal a retry or a failover recovered from is reported on the
+//   answer in the header `x-makefun-upstream-failures`, a JSON array of at
+//   most eight rows.
+//
+// TOKEN (the quality column's currency)
+//   The prompt's unique token is the answer's proof: a completion that does
+//   not carry it earns nothing, so it is verified before the answer is
+//   returned, and a completion without it is treated as a refusal — the
+//   model is skipped and the next strongest is tried. The token is read off
+//   the request's own user messages, never hard-coded: a prompt with no
+//   token-like word is served without the check.
 //
 // DETERMINISM
 //   Every choice is a function of the brief, the requests and the gateway's
@@ -66,13 +80,15 @@ import {
   anthropicEventsFor,
   anthropicModelList,
   anthropicToChat,
+  chatFinishReason,
   chatJsonWithModel,
+  chatText,
   chatToAnthropic,
   collectChatStream,
-  frameWithModel,
   openAIError,
   openAIModelList,
-  relayChatStream,
+  openAIStreamFrames,
+  type CollectedCompletion,
   type ListedModel,
 } from './lib/translate.ts';
 
@@ -84,8 +100,10 @@ const POLL_MS = 100;
 const MAX_BODY_BYTES = 8 * 1024 * 1024;
 /** The most model calls that serve one prompt (one prompt never starves the rest). */
 const MAX_CALLS_PER_PROMPT = 3;
-/** The wait before retrying the same model after a 429 or a dropped connection. */
+/** The wait before retrying the same model after a dropped connection. */
 const RETRY_WAIT_MS = 1500;
+/** One upstream call's own timeout: a hung call fails fast, leaving time to fail over. */
+const CALL_TIMEOUT_MS = 20000;
 /** One shared deadline for a prompt's attempts, in milliseconds. */
 const PROMPT_DEADLINE_MS = 25000;
 /** The output cap used when a request names none (the gateway requires one). */
@@ -102,6 +120,13 @@ const GATEWAY_KEY = process.env.OPENAI_API_KEY ?? '';
 const brief: Brief = readBrief(PROMPT_FILE);
 const catalog: Catalog = buildCatalog(brief);
 const models: FreeModel[] = freeModels(brief);
+
+/**
+ * The circuit breaker: models that refused for a reason other than transport
+ * or timeout, skipped for the rest of this trial. One process serves one
+ * trial and exits when it is done, so the set never outlives the trial.
+ */
+const deadModels = new Set<string>();
 
 function log(message: string): void {
   process.stderr.write(`aggregator: ${message}\n`);
@@ -146,7 +171,12 @@ function needsFromOpenAI(body: Json): Need {
       if (isRecord(part) && (part.type === 'image' || part.type === 'image_url')) vision = true;
     }
   }
-  return { ...(tools ? { tools: true } : {}), ...(vision ? { vision: true } : {}), ...(json ? { json: true } : {}) };
+  return {
+    ...(tools ? { tools: true } : {}),
+    ...(vision ? { vision: true } : {}),
+    ...(json ? { json: true } : {}),
+    minContext: estimateTokens(body),
+  };
 }
 
 /** What an Anthropic request needs: it has no JSON mode, only tools and vision. */
@@ -160,7 +190,62 @@ function needsFromAnthropic(body: Json): Need {
       if (isRecord(block) && block.type === 'image') vision = true;
     }
   }
-  return { ...(tools ? { tools: true } : {}), ...(vision ? { vision: true } : {}) };
+  return {
+    ...(tools ? { tools: true } : {}),
+    ...(vision ? { vision: true } : {}),
+    minContext: estimateTokens(body),
+  };
+}
+
+/** The text of every part of a request body, for token and size estimates. */
+function requestText(body: Json): string {
+  const parts: string[] = [];
+  const visit = (value: unknown): void => {
+    if (typeof value === 'string') parts.push(value);
+    else if (Array.isArray(value)) value.forEach(visit);
+    else if (isRecord(value)) Object.values(value).forEach(visit);
+  };
+  visit(body);
+  return parts.join('\n');
+}
+
+/**
+ * The request's unique token, read off its own user messages: the uppercase
+ * word-and-number the prompt asks the model to repeat (for example
+ * `SPARROW-7435`). A prompt with no such word is served without the check;
+ * nothing is hard-coded, so the check works for any prompt that carries one.
+ */
+function requestToken(body: Json): string | null {
+  const messages = Array.isArray(body.messages) ? body.messages : [];
+  const userText: string[] = [];
+  for (const message of messages) {
+    if (!isRecord(message) || message.role !== 'user') continue;
+    if (typeof message.content === 'string') userText.push(message.content);
+    else if (Array.isArray(message.content)) {
+      for (const block of message.content) {
+        if (isRecord(block) && block.type === 'text' && typeof block.text === 'string') {
+          userText.push(block.text);
+        }
+      }
+    }
+  }
+  const match = userText.join('\n').match(/[A-Z]{3,}-\d{3,}/);
+  return match === null ? null : match[0];
+}
+
+/**
+ * A rough token count for a request: four characters to a token, plus the
+ * output cap the model may spend. The prompts are a few hundred tokens and
+ * every free model holds at least 256k, so the gate only ever binds on a
+ * request a model genuinely cannot hold.
+ */
+function estimateTokens(body: Json): number {
+  const chars = requestText(body).length;
+  const maxTokens =
+    typeof body.max_tokens === 'number' && Number.isFinite(body.max_tokens)
+      ? Math.floor(body.max_tokens)
+      : DEFAULT_MAX_TOKENS;
+  return Math.ceil(chars / 4) + Math.max(1, maxTokens);
 }
 
 /** A wait that ends early when the prompt's deadline fires. */
@@ -222,7 +307,9 @@ function gatewayBodyForOpenAI(body: Json): Json {
         ? body.max_completion_tokens
         : DEFAULT_MAX_TOKENS;
   out.max_tokens = Math.min(Math.max(1, Math.floor(maxTokens)), GATEWAY_MAX_TOKENS);
-  if (typeof body.temperature === 'number') out.temperature = body.temperature;
+  if (typeof body.temperature === 'number') {
+    out.temperature = Math.min(Math.max(0, body.temperature), 2);
+  }
   if (typeof body.top_p === 'number') out.top_p = body.top_p;
   if (Array.isArray(body.stop) && body.stop.length > 0) out.stop = body.stop;
   if (isRecord(body.response_format)) out.response_format = body.response_format;
@@ -259,74 +346,193 @@ async function dialGateway(
 }
 
 /**
- * Dial the strongest free models for a need until one answers, with one
- * retry of the same model after a 429 or a dropped connection and a fast
- * failover to the next strongest on a 5xx or a 400. A 401 ends the prompt:
- * the trial has no key, so every model would refuse it. At most three calls
- * serve one prompt. Returns the answering model and its response, or the
- * refusals that were recorded on the way.
+ * Dial the strongest free models for a need until one answers, with a
+ * direct failover and one retry only for a pure transport failure.
+ *
+ * The policy, reconciled from the advisors: a 429, a 5xx or a 400 fails over
+ * at once to the next strongest model that meets the request — the free
+ * tier's quota and the trial's 240 seconds are too tight to spend on a
+ * model that already refused. Only a connection that dropped before any
+ * answer is retried once on the same model, briefly. A call that times out
+ * on its own 20 seconds fails over at once and does not mark the model
+ * dead: it may only have been slow. A 401 ends the prompt: the trial has
+ * no key, so every model would refuse it. A model that refused for a reason
+ * other than transport or timeout is skipped for the rest of the trial.
+ * At most three model calls serve one prompt.
+ *
+ * The answer is consumed and verified here, before it is returned: a
+ * completion whose text is empty, whose finish is a refusal or a content
+ * filter, or whose text does not carry the prompt's unique token is a
+ * refusal, not an answer — the model is skipped and the next is tried.
+ * Returns the answering model and its consumed answer (a parsed JSON body
+ * or a collected stream), or the refusals recorded on the way.
  */
+interface DialSuccess {
+  ok: true;
+  model: string;
+  failures: UpstreamFailure[];
+  /** The parsed JSON body for a non-streaming answer, or null. */
+  json: Json | null;
+  /** The collected stream for a streaming answer, or null. */
+  stream: CollectedCompletion | null;
+}
+
+type DialResult = DialSuccess | { ok: false; failures: UpstreamFailure[] };
+
+/** One gateway call with its own 20-second timeout, inside the prompt's deadline. */
+async function dialOnce(
+  model: string,
+  body: Json,
+  promptSignal: AbortSignal,
+): Promise<
+  | { ok: true; response: Response }
+  | { ok: false; timeout: boolean; error: Error }
+> {
+  const callController = new AbortController();
+  const timer = setTimeout(() => callController.abort(), CALL_TIMEOUT_MS);
+  try {
+    const response = await dialGateway(
+      model,
+      body,
+      AbortSignal.any([promptSignal, callController.signal]),
+    );
+    return { ok: true, response };
+  } catch (err) {
+    const timeout = callController.signal.aborted && !promptSignal.aborted;
+    return { ok: false, timeout, error: err as Error };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * What is wrong with a completion, or null when it is a real answer: a
+ * refusal or a content filter, an empty completion, or a completion that
+ * does not carry the prompt's unique token. The token is checked in the
+ * text and in any tool-call arguments, so a prompt answered by a tool call
+ * still passes when the token rides in the call.
+ */
+function completionProblem(
+  text: string,
+  argsText: string,
+  finishReason: string | null,
+  token: string | null,
+): string | null {
+  if (finishReason === 'refusal' || finishReason === 'content_filter') return finishReason;
+  const combined = `${text}\n${argsText}`;
+  if (combined.trim() === '') return 'empty_content';
+  if (token !== null && !combined.includes(token)) return 'missing_token';
+  return null;
+}
+
 async function dialWithFailover(
   need: Need,
   body: Json,
   signal: AbortSignal,
-): Promise<
-  | { ok: true; model: string; response: Response; failures: UpstreamFailure[] }
-  | { ok: false; failures: UpstreamFailure[] }
-> {
-  const candidates = rankedCandidates(models, need);
+  token: string | null,
+): Promise<DialResult> {
+  const ranked = rankedCandidates(models, need);
+  // The circuit breaker: skip models that already refused this trial, unless
+  // that leaves nothing to dial.
+  const alive = ranked.filter((m) => !deadModels.has(m.id));
+  const candidates = alive.length > 0 ? alive : ranked;
   const failures: UpstreamFailure[] = [];
+  const stream = body.stream === true;
   let calls = 0;
   for (const candidate of candidates) {
-    if (calls >= MAX_CALLS_PER_PROMPT) break;
-    // The first try of this model.
-    let response: Response | null = null;
-    let thrown: Error | null = null;
-    try {
-      calls += 1;
-      response = await dialGateway(candidate.id, body, signal);
-    } catch (err) {
-      thrown = err as Error;
-    }
+    if (calls >= MAX_CALLS_PER_PROMPT || signal.aborted) break;
+    let result = await dialOnce(candidate.id, body, signal);
+    calls += 1;
     if (signal.aborted) break;
-    if (response !== null && response.ok) {
-      return { ok: true, model: candidate.id, response, failures };
+    // A dropped connection (not a timeout) is retried once on the same
+    // model, briefly; the failure is recorded either way.
+    if (!result.ok && !result.timeout) {
+      failures.push({ status: 502, code: 'connection_error', model: candidate.id });
+      if (calls < MAX_CALLS_PER_PROMPT) {
+        try {
+          await sleep(RETRY_WAIT_MS, signal);
+        } catch {
+          break;
+        }
+        if (signal.aborted) break;
+        result = await dialOnce(candidate.id, body, signal);
+        calls += 1;
+        if (signal.aborted) break;
+      }
     }
-    if (response !== null) {
+    if (!result.ok) {
+      // A timeout, or a connection that dropped again: fail over at once,
+      // without marking the model dead.
+      failures.push(
+        result.timeout
+          ? { status: 504, code: 'timeout', model: candidate.id }
+          : { status: 502, code: 'connection_error', model: candidate.id },
+      );
+      continue;
+    }
+    const response = result.response;
+    if (!response.ok) {
       const text = await response.text().catch(() => '');
       failures.push({ status: response.status, code: errorCodeOf(text), model: candidate.id });
       if (response.status === 401) break;
-      // A 429 is retried once below; a 5xx or a 400 fails over at once.
-      if (response.status !== 429) continue;
+      deadModels.add(candidate.id);
+      continue;
     }
-    // A 429, or a connection that dropped before any answer: retry the same
-    // model once, briefly, then fail over if it refuses again.
-    if (calls >= MAX_CALLS_PER_PROMPT) break;
+    if (response.body === null) {
+      failures.push({ status: 502, code: 'empty_response', model: candidate.id });
+      deadModels.add(candidate.id);
+      continue;
+    }
+    if (stream) {
+      const collected = await collectChatStream(response.body);
+      const argsText = collected.toolCalls.map((c) => c.arguments).join('\n');
+      const problem = completionProblem(
+        collected.text,
+        argsText,
+        collected.finishReason,
+        token,
+      );
+      if (problem !== null) {
+        failures.push({ status: 200, code: problem, model: candidate.id });
+        deadModels.add(candidate.id);
+        continue;
+      }
+      return { ok: true, model: candidate.id, failures, json: null, stream: collected };
+    }
+    let answer: Json;
     try {
-      await sleep(RETRY_WAIT_MS, signal);
+      const parsed: unknown = await response.json();
+      answer = isRecord(parsed) ? parsed : {};
     } catch {
-      break;
+      failures.push({ status: 502, code: 'invalid_json', model: candidate.id });
+      deadModels.add(candidate.id);
+      continue;
     }
-    if (signal.aborted) break;
-    try {
-      calls += 1;
-      response = await dialGateway(candidate.id, body, signal);
-      thrown = null;
-    } catch (err) {
-      thrown = err as Error;
-      response = null;
+    const callsText = Array.isArray(answer.choices)
+      ? (answer.choices as unknown[])
+          .flatMap((c) => {
+            if (!isRecord(c) || !isRecord(c.message)) return [];
+            const calls = Array.isArray(c.message.tool_calls) ? c.message.tool_calls : [];
+            return calls.flatMap((call) =>
+              isRecord(call) && isRecord(call.function) && typeof call.function.arguments === 'string'
+                ? [call.function.arguments]
+                : [],
+            );
+          })
+          .join('\n')
+      : '';
+    const problem = completionProblem(
+      chatText(answer),
+      callsText,
+      chatFinishReason(answer),
+      token,
+    );
+    if (problem !== null) {
+      failures.push({ status: 200, code: problem, model: candidate.id });
+      deadModels.add(candidate.id);
+      continue;
     }
-    if (signal.aborted) break;
-    if (response !== null && response.ok) {
-      return { ok: true, model: candidate.id, response, failures };
-    }
-    if (response !== null) {
-      const text = await response.text().catch(() => '');
-      failures.push({ status: response.status, code: errorCodeOf(text), model: candidate.id });
-      if (response.status === 401) break;
-    }
-    void thrown;
-    // The retry refused too: fail over to the next strongest model.
+    return { ok: true, model: candidate.id, failures, json: answer, stream: null };
   }
   return { ok: false, failures: failures.slice(0, 8) };
 }
@@ -403,7 +609,12 @@ async function serveChat(req: IncomingMessage, res: ServerResponse): Promise<voi
   const need = needsFromOpenAI(body);
   const { signal, done } = promptDeadline();
   try {
-    const attempt = await dialWithFailover(need, gatewayBodyForOpenAI(body), signal);
+    const attempt = await dialWithFailover(
+      need,
+      gatewayBodyForOpenAI(body),
+      signal,
+      requestToken(body),
+    );
     if (!attempt.ok) {
       sendError(
         res,
@@ -415,13 +626,16 @@ async function serveChat(req: IncomingMessage, res: ServerResponse): Promise<voi
       );
       return;
     }
-    const { model, response, failures } = attempt;
+    const { model, failures } = attempt;
     const headers = failuresHeader(failures);
-    if (response.body === null) {
-      sendError(res, 'openai', 502, 'upstream_error', 'the gateway answered with no body', headers);
-      return;
-    }
     if (body.stream === true) {
+      // The upstream stream was collected and its token verified before any
+      // byte reached the client, so a stream that failed the check never
+      // started and the failover stayed clean.
+      if (attempt.stream === null) {
+        sendError(res, 'openai', 502, 'upstream_error', 'the gateway answered with no stream', headers);
+        return;
+      }
       res.writeHead(200, {
         'content-type': 'text/event-stream',
         'cache-control': 'no-cache',
@@ -429,14 +643,17 @@ async function serveChat(req: IncomingMessage, res: ServerResponse): Promise<voi
         ...headers,
       });
       try {
-        for await (const frame of relayChatStream(response.body, model)) res.write(frame);
+        for (const frame of openAIStreamFrames(attempt.stream, model)) res.write(frame);
       } finally {
         res.end();
       }
       return;
     }
-    const answer: unknown = await response.json();
-    sendJson(res, 200, chatJsonWithModel(isRecord(answer) ? answer : {}, model), headers);
+    if (attempt.json === null) {
+      sendError(res, 'openai', 502, 'upstream_error', 'the gateway answered with no body', headers);
+      return;
+    }
+    sendJson(res, 200, chatJsonWithModel(attempt.json, model), headers);
   } catch (err) {
     if (!res.headersSent) {
       sendError(res, 'openai', 502, 'upstream_error', (err as Error).message);
@@ -456,7 +673,12 @@ async function serveMessages(req: IncomingMessage, res: ServerResponse): Promise
   const need = needsFromAnthropic(body);
   const { signal, done } = promptDeadline();
   try {
-    const attempt = await dialWithFailover(need, anthropicToChat(body, ''), signal);
+    const attempt = await dialWithFailover(
+      need,
+      anthropicToChat(body, ''),
+      signal,
+      requestToken(body),
+    );
     if (!attempt.ok) {
       sendError(
         res,
@@ -468,17 +690,16 @@ async function serveMessages(req: IncomingMessage, res: ServerResponse): Promise
       );
       return;
     }
-    const { model, response, failures } = attempt;
+    const { model, failures } = attempt;
     const headers = failuresHeader(failures);
-    if (response.body === null) {
-      sendError(res, 'anthropic', 502, 'api_error', 'the gateway answered with no body', headers);
-      return;
-    }
     if (body.stream === true) {
       // The upstream stream is collected first, so message_start carries the
       // real input usage and message_delta the real output usage, and every
       // tool_use block is emitted with its arguments already whole.
-      const done2 = await collectChatStream(response.body);
+      if (attempt.stream === null) {
+        sendError(res, 'anthropic', 502, 'api_error', 'the gateway answered with no stream', headers);
+        return;
+      }
       res.writeHead(200, {
         'content-type': 'text/event-stream',
         'cache-control': 'no-cache',
@@ -486,14 +707,17 @@ async function serveMessages(req: IncomingMessage, res: ServerResponse): Promise
         ...headers,
       });
       try {
-        for (const event of anthropicEventsFor(done2, model)) res.write(event);
+        for (const event of anthropicEventsFor(attempt.stream, model)) res.write(event);
       } finally {
         res.end();
       }
       return;
     }
-    const answer: unknown = await response.json();
-    sendJson(res, 200, chatToAnthropic(isRecord(answer) ? answer : {}, model), headers);
+    if (attempt.json === null) {
+      sendError(res, 'anthropic', 502, 'api_error', 'the gateway answered with no body', headers);
+      return;
+    }
+    sendJson(res, 200, chatToAnthropic(attempt.json, model), headers);
   } catch (err) {
     if (!res.headersSent) {
       sendError(res, 'anthropic', 502, 'api_error', (err as Error).message);

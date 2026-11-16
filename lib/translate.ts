@@ -153,9 +153,30 @@ export function finishToStop(finish: unknown): string {
  * tool_result blocks become tool messages, tools and tool_choice are
  * rewritten, and the output cap, temperature, top_p, stop sequences and
  * streaming pass through.
+ *
+ * The gateway refuses a request with no output cap, so a request that names
+ * none gets the default 1024 (never the 400 a bare default would imply).
+ * Temperature is clamped to Anthropic's 0-1, and `top_k` is dropped: the
+ * gateway's wire has no such field. Consecutive messages of one role are
+ * merged, because the upstream wire wants strict user/assistant alternation,
+ * and an empty content array becomes an empty string rather than a dropped
+ * turn.
  */
 export function anthropicToChat(body: Json, model: string): Json {
   const messages: Json[] = [];
+  const pushMessage = (message: Json): void => {
+    const previous = messages[messages.length - 1];
+    if (
+      previous !== undefined &&
+      previous.role === message.role &&
+      typeof previous.content === 'string' &&
+      typeof message.content === 'string'
+    ) {
+      previous.content = previous.content === '' ? message.content : `${previous.content}\n${message.content}`;
+      return;
+    }
+    messages.push(message);
+  };
   const system = plainText(body.system);
   if (system !== '') messages.push({ role: 'system', content: system });
   const source = Array.isArray(body.messages) ? body.messages : [];
@@ -164,7 +185,7 @@ export function anthropicToChat(body: Json, model: string): Json {
     const assistant = raw.role === 'assistant';
     const content = raw.content;
     if (typeof content === 'string') {
-      messages.push({ role: assistant ? 'assistant' : 'user', content });
+      pushMessage({ role: assistant ? 'assistant' : 'user', content });
       continue;
     }
     if (!Array.isArray(content)) continue;
@@ -182,7 +203,7 @@ export function anthropicToChat(body: Json, model: string): Json {
         });
       }
       const text = plainText(content);
-      messages.push({
+      pushMessage({
         role: 'assistant',
         content: text !== '' ? text : null,
         ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}),
@@ -190,9 +211,11 @@ export function anthropicToChat(body: Json, model: string): Json {
       continue;
     }
     const parts: Json[] = [];
+    let sawToolResult = false;
     for (const block of content) {
       if (!isRecord(block)) continue;
       if (block.type === 'tool_result') {
+        sawToolResult = true;
         messages.push({
           role: 'tool',
           tool_call_id: typeof block.tool_use_id === 'string' ? block.tool_use_id : '',
@@ -203,12 +226,19 @@ export function anthropicToChat(body: Json, model: string): Json {
       const part = openAIPart(block);
       if (part !== null) parts.push(part);
     }
-    if (parts.length > 0) messages.push({ role: 'user', content: parts });
+    if (parts.length > 0) pushMessage({ role: 'user', content: parts });
+    else if (!sawToolResult) pushMessage({ role: 'user', content: '' });
   }
 
   const out: Json = { model, messages };
-  if (typeof body.max_tokens === 'number') out.max_tokens = body.max_tokens;
-  if (typeof body.temperature === 'number') out.temperature = body.temperature;
+  const maxTokens =
+    typeof body.max_tokens === 'number' && Number.isFinite(body.max_tokens)
+      ? Math.min(Math.max(1, Math.floor(body.max_tokens)), 8192)
+      : 1024;
+  out.max_tokens = maxTokens;
+  if (typeof body.temperature === 'number') {
+    out.temperature = Math.min(Math.max(0, body.temperature), 1);
+  }
   if (typeof body.top_p === 'number') out.top_p = body.top_p;
   if (Array.isArray(body.stop_sequences) && body.stop_sequences.length > 0) {
     out.stop = body.stop_sequences;
@@ -239,6 +269,7 @@ export function anthropicToChat(body: Json, model: string): Json {
       out.tool_choice = { type: 'function', function: { name: choice.name } };
     }
   }
+  if (body.disable_parallel_tool_use === true) out.parallel_tool_calls = false;
   if (body.stream === true) {
     out.stream = true;
     out.stream_options = { include_usage: true };
@@ -284,6 +315,22 @@ export function chatToAnthropic(body: Json, model: string): Json {
 /** A Chat Completions answer with `model` set to the id the entry dialled. */
 export function chatJsonWithModel(body: Json, model: string): Json {
   return { ...body, model };
+}
+
+/** The assistant message's text in a Chat Completions answer, '' when none. */
+export function chatText(body: Json): string {
+  const choices = Array.isArray(body.choices) ? body.choices : [];
+  const choice = isRecord(choices[0]) ? choices[0] : {};
+  const message = isRecord(choice.message) ? choice.message : {};
+  if (typeof message.content === 'string') return message.content;
+  return plainText(message.content);
+}
+
+/** The finish reason of a Chat Completions answer, null when it has none. */
+export function chatFinishReason(body: Json): string | null {
+  const choices = Array.isArray(body.choices) ? body.choices : [];
+  const choice = isRecord(choices[0]) ? choices[0] : {};
+  return typeof choice.finish_reason === 'string' ? choice.finish_reason : null;
 }
 
 /** One server-sent event: `event: <name>` when named, then the data line. */
@@ -340,6 +387,8 @@ export interface CollectedCompletion {
   outputTokens: number;
   sawFinish: boolean;
   sawDone: boolean;
+  /** The raw SSE frames as they arrived, each without its trailing blank line. */
+  frames: string[];
 }
 
 /**
@@ -362,8 +411,10 @@ export async function collectChatStream(
   let outputTokens = 0;
   let sawFinish = false;
   let sawDone = false;
+  const frames: string[] = [];
 
   const handleFrame = (frame: string): void => {
+    if (frame.trim() !== '') frames.push(frame);
     for (const line of frame.split('\n')) {
       const trimmed = line.trim();
       if (!trimmed.startsWith('data:')) continue;
@@ -435,6 +486,7 @@ export async function collectChatStream(
     outputTokens,
     sawFinish,
     sawDone,
+    frames,
   };
 }
 
@@ -515,70 +567,15 @@ export function anthropicEventsFor(done: CollectedCompletion, model: string): st
 }
 
 /**
- * A Chat Completions SSE stream relayed frame by frame, every data payload's
- * `model` the id the entry dialled. Frames are split on the blank line that
- * ends them; a frame cut across reads is held until its end arrives, and a
- * body that ends without one is relayed as it is. The relay ends with
- * `[DONE]` even when the upstream body did not carry one.
+ * A collected Chat Completions stream as OpenAI SSE frames, every data
+ * payload's `model` the id the entry dialled, with a synthetic finish chunk
+ * and `[DONE]` appended when the upstream body lacked them. The frames were
+ * collected before any byte reached the client, so a stream that failed its
+ * token check never started: failover stays clean.
  */
-export async function* relayChatStream(
-  upstream: ReadableStream<Uint8Array>,
-  model: string,
-): AsyncGenerator<string> {
-  const reader = upstream.getReader();
-  const decoder = new TextDecoder();
-  let buffer = '';
-  let sawDone = false;
-  let sawFinish = false;
-  let lastUsage: Json | null = null;
-  try {
-    for (;;) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, '\n');
-      let at = buffer.indexOf('\n\n');
-      while (at !== -1) {
-        const frame = buffer.slice(0, at);
-        buffer = buffer.slice(at + 2);
-        for (const line of frame.split('\n')) {
-          const trimmed = line.trim();
-          if (trimmed.startsWith('data:')) {
-            const payload = trimmed.slice(5).trim();
-            if (payload === '[DONE]') sawDone = true;
-            else {
-              try {
-                const chunk: unknown = JSON.parse(payload);
-                if (isRecord(chunk)) {
-                  if (isRecord(chunk.usage)) lastUsage = chunk.usage;
-                  const choices = Array.isArray(chunk.choices) ? chunk.choices : [];
-                  const choice = isRecord(choices[0]) ? choices[0] : null;
-                  if (choice !== null && typeof choice.finish_reason === 'string') sawFinish = true;
-                }
-              } catch {
-                // Not JSON: relay it untouched.
-              }
-            }
-          }
-        }
-        yield frameWithModel(frame, model);
-        at = buffer.indexOf('\n\n');
-      }
-    }
-    buffer += decoder.decode();
-    if (buffer.trim() !== '') {
-      for (const line of buffer.split('\n')) {
-        const trimmed = line.trim();
-        if (trimmed.startsWith('data:')) {
-          const payload = trimmed.slice(5).trim();
-          if (payload === '[DONE]') sawDone = true;
-        }
-      }
-      yield frameWithModel(buffer, model);
-    }
-  } finally {
-    reader.releaseLock();
-  }
-  if (!sawFinish) {
+export function openAIStreamFrames(done: CollectedCompletion, model: string): string[] {
+  const out: string[] = done.frames.map((frame) => frameWithModel(frame, model));
+  if (!done.sawFinish) {
     const finishChunk: Json = {
       id: 'chatcmpl-relay',
       object: 'chat.completion.chunk',
@@ -586,8 +583,15 @@ export async function* relayChatStream(
       model,
       choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
     };
-    if (lastUsage !== null) finishChunk.usage = lastUsage;
-    yield `data: ${JSON.stringify(finishChunk)}\n\n`;
+    if (done.outputTokens > 0 || done.inputTokens > 0) {
+      finishChunk.usage = {
+        prompt_tokens: done.inputTokens,
+        completion_tokens: done.outputTokens,
+        total_tokens: done.inputTokens + done.outputTokens,
+      };
+    }
+    out.push(`data: ${JSON.stringify(finishChunk)}\n\n`);
   }
-  if (!sawDone) yield 'data: [DONE]\n\n';
+  if (!done.sawDone) out.push('data: [DONE]\n\n');
+  return out;
 }

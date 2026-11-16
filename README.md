@@ -24,6 +24,8 @@ the strongest model that meets what the prompt needs:
 - JSON-mode prompt: the highest-rated model that supports JSON mode (the
   top-rated model does not), so the answer comes back as real JSON.
 - Tools / vision: the highest-rated model that supports the capability.
+- Context: a model whose context is shorter than the request's estimated
+  tokens cannot hold it, so it is never dialled for that request.
 
 The `model` field always names the model that actually answered, never a
 fallback labelled as the requested one. Real upstream token counts are
@@ -31,12 +33,23 @@ reported; nothing is fabricated.
 
 ## Failover
 
-At most 3 model calls per prompt, under one shared 25-second deadline:
+The failover is direct: a 429, a 5xx or a 400 fails over at once to the next
+strongest model that meets the prompt, because the free tier's quota and
+the trial's 240 seconds are too tight to spend on a model that already
+refused. Only a connection that dropped before any answer is retried once
+on the same model, briefly. A call that times out on its own 20 seconds
+fails over at once. A 401 ends the prompt at once: without a key every
+model would refuse. At most 3 model calls serve one prompt, under one
+shared 25-second deadline, so one prompt never starves the other five.
 
-- 429 or a dropped connection: retry the same model once after 1.5 s.
-- 5xx or 400: fail over at once to the next strongest model that meets the
-  prompt.
-- 401: give up immediately — every model would refuse without a key.
+A model that refused for a reason other than transport or timeout is
+skipped for the rest of the trial (a circuit breaker): re-dialling it
+would only burn quota.
+
+The prompt's unique token is verified before the answer is returned: a
+completion that does not carry it is treated as a refusal, and the next
+strongest model is tried. The token is read off the request's own user
+messages, never hard-coded.
 
 Every real upstream refusal is reported in the
 `x-makefun-upstream-failures` header (JSON array, at most 8 rows of

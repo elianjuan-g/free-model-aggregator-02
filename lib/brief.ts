@@ -60,6 +60,8 @@ export interface Need {
   tools?: boolean;
   vision?: boolean;
   json?: boolean;
+  /** The request's estimated tokens: a model whose context is shorter cannot hold it. */
+  minContext?: number;
 }
 
 /** One prompt the env will send, as the brief lists it. */
@@ -249,6 +251,15 @@ export function meetsNeed(need: Need, model: FreeModel): boolean {
   if (need.tools === true && model.tools !== true) return false;
   if (need.vision === true && model.vision !== true) return false;
   if (need.json === true && model.json !== true) return false;
+  // A context length the brief did not publish cannot be checked, so it does
+  // not exclude a model; a published length shorter than the request does.
+  if (
+    need.minContext !== undefined &&
+    model.contextLength !== null &&
+    model.contextLength < need.minContext
+  ) {
+    return false;
+  }
   return true;
 }
 
