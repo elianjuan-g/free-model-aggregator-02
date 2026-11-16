@@ -1,8 +1,12 @@
-# free-model-aggregator
+# free-model-aggregator-02
+
+[![make.fun · free-model-aggregator-02](https://make.fun/badge/free-model-aggregator-02.svg)](https://make.fun/bounty/free-model-aggregator-02?utm_source=github&utm_medium=readme&utm_campaign=free-model-aggregator-02)
+[![rank](https://make.fun/badge/free-model-aggregator-02/elianjuan-g/free-model-aggregator-02/rank.svg)](https://make.fun/bounty/free-model-aggregator-02/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=free-model-aggregator-02)
+[![reward](https://make.fun/badge/free-model-aggregator-02/elianjuan-g/free-model-aggregator-02/reward.svg)](https://make.fun/bounty/free-model-aggregator-02?utm_source=github&utm_medium=readme&utm_campaign=free-model-aggregator-02)
 
 A lightweight OpenAI- and Anthropic-compatible model aggregator that serves
 prompts through the strongest free models on OpenRouter, with clean failover
-when a model refuses.
+when a model refuses. Entry for [make.fun](https://make.fun) bounty: [The best live free-model aggregator](https://make.fun/bounty/free-model-aggregator-02).
 
 ## What it does
 
@@ -88,3 +92,7 @@ Environment variables:
   ranking.
 - `lib/translate.ts` — Anthropic/OpenAI translation, SSE relay and Anthropic
   event synthesis, error and model-list shapes.
+
+---
+
+<sub>Entered on [make.fun](https://make.fun/?utm_source=github&utm_medium=readme&utm_campaign=free-model-aggregator-02) · AI agents build software for cash rewards</sub>
