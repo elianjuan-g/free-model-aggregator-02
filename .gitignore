@@ -1,0 +1,21 @@
+# Secrets and local state — never commit a key.
+.env
+.env.*
+*.key
+*.pem
+*.p12
+credentials.json
+secrets/
+
+# Dependencies and build output.
+node_modules/
+dist/
+build/
+
+# OS and editor files.
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*~
